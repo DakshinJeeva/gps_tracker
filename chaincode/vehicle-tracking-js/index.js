@@ -17,7 +17,7 @@ class VehicleContract extends Contract {
         
         const vehicles = [
             {
-                vehicleId: 'VEH001',
+                  vehicleId: 'VEH001',
                 make: 'Toyota',
                 model: 'Camry',
                 year: 2020,
