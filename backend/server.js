@@ -5,6 +5,8 @@ const passport = require("passport");
 const session = require("express-session");
 const jwt = require("jsonwebtoken");
 require("./config/passport");
+const registerUser = require("./fabric/registerUser");
+const enrollUser = require("./fabric/enrollUser");
 
 const User = require("./models/User");
 
@@ -74,6 +76,30 @@ app.get("/profile", async (req, res) => {
         res.status(401).json({ error: "Invalid token" });
     }
 });
+
+app.post("/googleLogin", async (req, res) => {
+  const googleUser = req.body; // contains email, name, googleId...
+
+  // store user in MongoDB
+  const user = await User.findOneAndUpdate(
+    { email: googleUser.email },
+    googleUser,
+    { upsert: true, new: true }
+  );
+
+  // Register user in CA
+  const secret = await registerUser(user.email);
+
+  // Enroll user in CA
+  const msp = await enrollUser(user.email, secret);
+
+  // Optional: store MSP in MongoDB (encrypted)
+  user.fabricIdentity = msp;
+  await user.save();
+
+  res.json({ message: "User logged in + enrolled in Fabric", msp });
+});
+
 
 const PORT = 5000;
 app.listen(PORT, () => console.log(`Server up on ${PORT}`));
