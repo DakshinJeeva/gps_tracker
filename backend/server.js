@@ -4,7 +4,7 @@ const mongoose = require("mongoose");
 const passport = require("passport");
 const session = require("express-session");
 const jwt = require("jsonwebtoken");
-require("./config/passport");
+require("./config/passport"); // Google strategy
 const registerUser = require("./fabric/registerUser");
 const enrollUser = require("./fabric/enrollUser");
 
@@ -12,94 +12,131 @@ const User = require("./models/User");
 
 const app = express();
 
+// ---------------------
 // Middleware
+// ---------------------
 app.use(express.json());
-
-// Cookie session for passport
 app.use(
-    session({
-        secret: process.env.SESSION_SECRET,
-        resave: false,
-        saveUninitialized: false,
-        cookie: { secure: false } // set secure:true in production with HTTPS
-    })
+  session({
+    secret: process.env.SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: { secure: false } // true in production with HTTPS
+  })
 );
 app.use(passport.initialize());
 app.use(passport.session());
 
+// ---------------------
 // MongoDB connection
+// ---------------------
 mongoose.connect(process.env.MONGO_URI)
-.then(() => console.log("MongoDB Connected"))
-.catch(err => console.log(err));
+  .then(() => console.log("✅ MongoDB Connected"))
+  .catch(err => console.error("❌ MongoDB connection error:", err));
 
-// --------------------------------------------
-// Google Auth Routes
-// --------------------------------------------
+// ---------------------
+// Google OAuth Routes
+// ---------------------
 
-// 1️⃣ Redirect to Google Login
-app.get("/auth/google",
-    passport.authenticate("google", { scope: ["profile", "email"] })
-);
+// 1️⃣ Redirect to Google login
+app.get("/auth/google", (req, res, next) => {
+  console.log("➡️ Redirecting to Google login...");
+  next();
+}, passport.authenticate("google", { scope: ["profile", "email"] }));
 
-// 2️⃣ Google callback
-app.get(
-    "/auth/google/callback",
-    passport.authenticate("google", { failureRedirect: "/login" }),
-    (req, res) => {
-        // Create JWT token
-        const token = jwt.sign(
-            { id: req.user._id, email: req.user.email },
-            process.env.JWT_SECRET
-        );
-
-        res.json({
-            message: "Login success",
-            token,
-            user: req.user
-        });
-    }
-);
-
-// --------------------------------------------
-
-// Protected route example
-app.get("/profile", async (req, res) => {
+// 2️⃣ Callback + Fabric automatic enrollment
+app.get("/auth/google/callback",
+  (req, res, next) => {
+    console.log("➡️ Google callback route hit");
+    next();
+  },
+  passport.authenticate("google", { failureRedirect: "/login" }),
+  async (req, res) => {
     try {
-        const token = req.headers.authorization?.split(" ")[1];
-        if (!token) return res.status(401).json({ error: "No token" });
+      console.log("🔥 Inside callback handler");
+      console.log("User object from Google:", req.user);
 
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        const user = await User.findById(decoded.id);
+      // 1️⃣ Find or create user in MongoDB
+      let user = await User.findOne({ email: req.user.email });
+      console.log("Found user in DB:", user);
 
-        res.json({ user });
-    } catch (error) {
-        res.status(401).json({ error: "Invalid token" });
+      if (!user) {
+        console.log("User not found. Creating new user...");
+        user = await User.create({
+          googleId: req.user.googleId,
+          email: req.user.email,
+          name: req.user.name,
+          picture: req.user.picture
+        });
+        console.log("New user created:", user);
+      }
+
+      // 2️⃣ Check Fabric identity
+      console.log("Checking Fabric identity...");
+      if (!user.fabricIdentity || !user.fabricIdentity.credentials?.certificate) {
+        console.log("Fabric identity not found. Registering user in CA...");
+
+        const secret = await registerUser(user.email);
+        console.log("Secret from CA:", secret);
+
+        const msp = await enrollUser(user.email, secret);
+        console.log("MSP enrolled:", msp);
+
+        // Save Fabric MSP in MongoDB
+        user.fabricIdentity = msp;
+        await user.save();
+        console.log("Fabric identity saved to MongoDB");
+      } else {
+        console.log("User already has a Fabric identity:", user.fabricIdentity);
+      }
+
+      // 3️⃣ Create JWT token
+      const token = jwt.sign(
+        { id: user._id, email: user.email },
+        process.env.JWT_SECRET,
+        { expiresIn: "1d" }
+      );
+      console.log("JWT token created:", token);
+
+      res.json({
+        message: "Login + Fabric enrollment success",
+        token,
+        user
+      });
+
+    } catch (err) {
+      console.error("❌ Error in Google callback:", err);
+      res.status(500).json({
+        error: "Fabric enrollment or login failed",
+        details: err.message
+      });
     }
+  }
+);
+
+// ---------------------
+// Protected route example
+// ---------------------
+app.get("/profile", async (req, res) => {
+  try {
+    console.log("➡️ /profile route hit");
+    const token = req.headers.authorization?.split(" ")[1];
+    console.log("Token received:", token);
+    if (!token) return res.status(401).json({ error: "No token provided" });
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    console.log("Decoded JWT:", decoded);
+
+    const user = await User.findById(decoded.id);
+    console.log("User fetched from DB:", user);
+
+    res.json({ user });
+  } catch (error) {
+    console.error("❌ Error in /profile route:", error);
+    res.status(401).json({ error: "Invalid token" });
+  }
 });
 
-app.post("/googleLogin", async (req, res) => {
-  const googleUser = req.body; // contains email, name, googleId...
-
-  // store user in MongoDB
-  const user = await User.findOneAndUpdate(
-    { email: googleUser.email },
-    googleUser,
-    { upsert: true, new: true }
-  );
-
-  // Register user in CA
-  const secret = await registerUser(user.email);
-
-  // Enroll user in CA
-  const msp = await enrollUser(user.email, secret);
-
-  // Optional: store MSP in MongoDB (encrypted)
-  user.fabricIdentity = msp;
-  await user.save();
-
-  res.json({ message: "User logged in + enrolled in Fabric", msp });
-});
-
-
-const PORT = 5000;
-app.listen(PORT, () => console.log(`Server up on ${PORT}`));
+// ---------------------
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
